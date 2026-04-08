@@ -1,0 +1,54 @@
+#!/bin/bash
+set -e
+NIM_JOBS=""
+SEARCH_TERM=""
+while [ $# -gt 0 ]; do
+    case $1 in
+        -j) NIM_JOBS="NIM_PARAMS=--parallelBuild:$2"; shift 2;;
+        -j*) NIM_JOBS="NIM_PARAMS=--parallelBuild:${1#-j}"; shift;;
+        *) SEARCH_TERM="$1"; shift;;
+    esac
+done
+
+if [ -z "$SEARCH_TERM" ]; then
+    # --- NO PARAMETER: Run all tests ---
+    lineflush -o output_testcommon.log env POSTGRES=1 $NIM_JOBS make testcommon
+    lineflush -o output_testwaku.log env POSTGRES=1 $NIM_JOBS make testwaku
+    lineflush -o output_testwakunode2.log env POSTGRES=1 $NIM_JOBS make testwakunode2
+    echo ""
+    grep Summary output_testcommon.log output_testwaku.log output_testwakunode2.log
+    echo "All tests done."
+elif [ "$SEARCH_TERM" = "common" ]; then
+    lineflush -o output_testcommon.log env POSTGRES=1 $NIM_JOBS make testcommon
+    echo "Test done."
+elif [ "$SEARCH_TERM" = "waku" ]; then
+    lineflush -o output_testwaku.log env POSTGRES=1 $NIM_JOBS make testwaku
+    echo "Test done."
+elif [ "$SEARCH_TERM" = "node" ]; then
+    lineflush -o output_testwakunode2.log env POSTGRES=1 $NIM_JOBS make testwakunode2
+    echo "Test done."
+else
+    # --- PARAMETER GIVEN: Search for a specific test file ---
+    MATCHES=$(find tests -name "*.nim" | grep "$SEARCH_TERM")
+
+    if [ -z "$MATCHES" ]; then
+        MATCH_COUNT=0
+    else
+        MATCH_COUNT=$(echo "$MATCHES" | wc -l)
+    fi
+
+    if [ "$MATCH_COUNT" -eq 0 ]; then
+        echo "ERROR: Zero matches found for '$SEARCH_TERM'"
+        exit 1
+    elif [ "$MATCH_COUNT" -gt 1 ]; then
+        echo "ERROR: Too many matches ($MATCH_COUNT):"
+        echo "$MATCHES"
+        echo "Please be more specific."
+        exit 1
+    else
+        TARGET=$(echo "$MATCHES" | xargs)
+        echo "Found: $TARGET"
+        lineflush -o output_test.log env POSTGRES=1 $NIM_JOBS make test "$TARGET"
+        echo "Test done."
+    fi
+fi

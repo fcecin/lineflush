@@ -1,0 +1,5 @@
+#!/bin/bash
+set -e
+rm -rf ~/.nimble/pkgs2
+echo "Global nimble cache nuked."
+exec ~/sh/nnuke

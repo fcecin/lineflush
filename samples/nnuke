@@ -1,0 +1,8 @@
+#!/bin/bash
+set -e
+lineflush -o output_clean.log sh -c 'make clean; true'
+rm -rf nimbledeps nimble.paths nimble.lock.json
+git restore nimble.lock
+git submodule deinit -f --all
+git submodule update --init --recursive
+echo "Nuked."

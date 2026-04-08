@@ -1,0 +1,293 @@
+#!/usr/bin/env python3
+"""
+lineflush - run commands with colors and clean log output.
+
+Wraps a command in a pseudo-terminal so it emits colors and animations,
+while protecting important output from being overwritten by terminal
+spinners. Optionally logs clean, finalized output to a file.
+
+The problem: many build tools (nimble, cargo, npm, etc.) use animated
+spinners that overwrite previous terminal lines using cursor-up escape
+sequences. This can destroy important output like test summaries. When
+piping through `tee` you lose colors; when using `unbuffer` you get
+colors but the spinner damage is preserved in the log.
+
+lineflush solves both: colors and animations work on the terminal, and
+the log file contains only finalized lines with spinner damage removed.
+"""
+
+import sys
+import os
+import re
+import pty
+import argparse
+import subprocess
+
+__version__ = "1.0.0"
+
+# Escape sequence patterns
+DESTRUCTIVE = re.compile(r'\x1b\[\d*A|\x1b\[\d*K|\x1b\[\d*G|\r(?!\n)')
+CURSOR_UP = re.compile(r'\x1b\[(\d*)A')
+ANSI_ESCAPE = re.compile(r'\x1b\[[^a-zA-Z]*[a-zA-Z]')
+
+# Number of completed lines to buffer before writing to log.
+# Keeps recently-written lines out of the log until they are safely
+# past the reach of any cursor-up sequence.
+LOG_BUFFER_SIZE = 3
+
+
+def strip_ansi(s):
+    """Remove all ANSI escape sequences from a string."""
+    return ANSI_ESCAPE.sub('', s)
+
+
+def char_diff(a, b):
+    """Count character-level differences between two strings (stripped of ANSI)."""
+    a = strip_ansi(a).strip()
+    b = strip_ansi(b).strip()
+    diff = abs(len(a) - len(b))
+    for i in range(min(len(a), len(b))):
+        if a[i] != b[i]:
+            diff += 1
+    return diff
+
+
+class LineFlush:
+    """
+    Core engine that processes a byte stream, passes it through to the
+    terminal, detects and neutralizes destructive cursor-up sequences,
+    and optionally writes clean output to a log file.
+
+    Detection algorithm:
+
+    When a cursor-up (ESC[A) arrives, the two most recently completed
+    lines are compared. If they differ by <= 5 characters, the lines
+    are part of an in-place animation (e.g. a spinner) and the
+    cursor-up is allowed through. If they differ by more, the cursor-up
+    would overwrite unrelated content (e.g. a test summary) and is
+    suppressed.
+
+    When a cursor-up is suppressed, output enters "hold" mode: all
+    subsequent output is buffered rather than emitted. This captures
+    any trailing spinner frames. Hold mode exits when two consecutive
+    newlines arrive without an intervening cursor-up (structural proof
+    that real content has resumed). At EOF, held content is dropped.
+
+    Log output has destructive escape sequences stripped but ANSI color
+    codes are preserved.
+    """
+
+    def __init__(self, logfile=None, output=None, diff_threshold=5, log_buffer_size=LOG_BUFFER_SIZE):
+        self.logfile = logfile
+        self.output = output or sys.stdout.buffer
+        self.diff_threshold = diff_threshold
+        self.log_buffer_size = log_buffer_size
+
+        # Log buffering
+        self._log_lines = []
+        self._log_current = []
+
+        # Line tracking: last 2 completed lines
+        self._line_history = ["", ""]
+        self._current_line = []
+
+        # Hold state
+        self._hold_buf = []
+        self._hold_log = []
+        self._holding = False
+        self._lines_since_curup = 0
+
+    def _log_char(self, c):
+        if not self.logfile:
+            return
+        if c == '\n':
+            self._log_lines.append(''.join(self._log_current))
+            self._log_current.clear()
+            while len(self._log_lines) > self.log_buffer_size:
+                line = self._log_lines.pop(0)
+                self.logfile.write(DESTRUCTIVE.sub('', line) + '\n')
+                self.logfile.flush()
+        else:
+            self._log_current.append(c)
+
+    def _flush_hold(self):
+        for chunk in self._hold_buf:
+            self.output.write(chunk.encode('utf-8'))
+        self.output.flush()
+        for chunk in self._hold_log:
+            for c in chunk:
+                self._log_char(c)
+        self._hold_buf.clear()
+        self._hold_log.clear()
+        self._holding = False
+        self._lines_since_curup = 0
+
+    def _drop_hold(self):
+        self._hold_buf.clear()
+        self._hold_log.clear()
+        self._holding = False
+        self._lines_since_curup = 0
+
+    def process(self, data):
+        """Process a chunk of bytes from the child process."""
+        raw = data.decode('utf-8', errors='replace')
+        term_out = []
+        log_out = []
+        i = 0
+
+        while i < len(raw):
+            if raw[i] == '\x1b' and i + 1 < len(raw) and raw[i + 1] == '[':
+                m = CURSOR_UP.match(raw, i)
+                if m:
+                    d = char_diff(self._line_history[0], self._line_history[1])
+                    if d <= self.diff_threshold:
+                        if self._holding:
+                            self._hold_buf.append(m.group(0))
+                            self._lines_since_curup = 0
+                        else:
+                            term_out.append(m.group(0))
+                    else:
+                        if not self._holding:
+                            self.output.write(
+                                ''.join(term_out).encode('utf-8'))
+                            self.output.flush()
+                            for c in ''.join(log_out):
+                                self._log_char(c)
+                            term_out.clear()
+                            log_out.clear()
+                            self._holding = True
+                        self._lines_since_curup = 0
+                        self._line_history[0] = self._line_history[1]
+                    i = m.end()
+                    continue
+
+            if raw[i] == '\r':
+                if self._holding:
+                    self._hold_buf.append('\r')
+                else:
+                    term_out.append('\r')
+            elif raw[i] == '\n':
+                completed = ''.join(self._current_line)
+                self._line_history[0] = self._line_history[1]
+                self._line_history[1] = completed
+                self._current_line.clear()
+
+                if self._holding:
+                    self._hold_buf.append('\n')
+                    self._hold_log.append('\n')
+                    self._lines_since_curup += 1
+                    if self._lines_since_curup >= 2:
+                        self._flush_hold()
+                else:
+                    term_out.append('\n')
+                    log_out.append('\n')
+            else:
+                self._current_line.append(raw[i])
+                if self._holding:
+                    self._hold_buf.append(raw[i])
+                    self._hold_log.append(raw[i])
+                else:
+                    term_out.append(raw[i])
+                    log_out.append(raw[i])
+            i += 1
+
+        if term_out:
+            self.output.write(''.join(term_out).encode('utf-8'))
+            self.output.flush()
+        for c in ''.join(log_out):
+            self._log_char(c)
+
+    def finish(self, close_log=True):
+        """Finalize: drop held spinner remnants and flush log buffer."""
+        self._drop_hold()
+        if self.logfile:
+            if self._log_current:
+                self._log_lines.append(''.join(self._log_current))
+            for line in self._log_lines:
+                self.logfile.write(DESTRUCTIVE.sub('', line) + '\n')
+            self.logfile.flush()
+            if close_log:
+                self.logfile.close()
+
+
+def run(argv=None):
+    """Entry point: parse arguments, run the command, return exit code."""
+    parser = argparse.ArgumentParser(
+        prog='lineflush',
+        description='Run commands with colors preserved and clean log output.',
+    )
+    parser.add_argument(
+        '-o', '--output',
+        metavar='LOGFILE',
+        help='Write clean output to this log file',
+    )
+    parser.add_argument(
+        '-t', '--threshold',
+        type=int,
+        default=5,
+        metavar='N',
+        help='Character diff threshold for spinner detection (default: 5)',
+    )
+    parser.add_argument(
+        '--version',
+        action='version',
+        version=f'%(prog)s {__version__}',
+    )
+    parser.add_argument(
+        'command',
+        nargs=argparse.REMAINDER,
+        help='Command to run',
+    )
+
+    args = parser.parse_args(argv)
+    cmd = args.command
+
+    # Skip leading '--' separator if present
+    if cmd and cmd[0] == '--':
+        cmd = cmd[1:]
+
+    if not cmd:
+        parser.print_usage(sys.stderr)
+        print("lineflush: error: no command specified", file=sys.stderr)
+        return 1
+
+    logfile = open(args.output, 'w') if args.output else None
+
+    master_fd, slave_fd = pty.openpty()
+    proc = subprocess.Popen(
+        cmd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        stdin=slave_fd,
+        close_fds=True,
+    )
+    os.close(slave_fd)
+
+    engine = LineFlush(
+        logfile=logfile,
+        diff_threshold=args.threshold,
+    )
+
+    try:
+        while True:
+            try:
+                data = os.read(master_fd, 4096)
+            except OSError:
+                break
+            if not data:
+                break
+            engine.process(data)
+    finally:
+        os.close(master_fd)
+        proc.wait()
+        engine.finish()
+
+    return proc.returncode
+
+
+def main():
+    sys.exit(run())
+
+
+if __name__ == '__main__':
+    main()
