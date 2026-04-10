@@ -12,6 +12,5 @@ if [ ! -d nimbledeps ] && [ -d ~/localdeps ]; then
     echo "Restoring nimbledeps from cache..."
     cp -a ~/localdeps nimbledeps
 fi
-lineflush -o output_deps.log env POSTGRES=1 $NIM_JOBS make deps
 lineflush -o output_wakunode2.log env POSTGRES=1 $NIM_JOBS make wakunode2
 echo "Done."

@@ -1,0 +1,4 @@
+#!/bin/bash
+set -e
+rm -rf build nimcache nimbledeps
+echo "Cleaned build artifacts and nimbledeps."
