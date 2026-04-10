@@ -1,4 +1,4 @@
 #!/bin/bash
 set -e
-rm -rf build nimcache nimbledeps
+rm -rf build nimcache nimbledeps nimble.paths
 echo "Cleaned build artifacts and nimbledeps."
